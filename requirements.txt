@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+transformers
+torch
+seqeval
+shap
+lime
+streamlit
+pyyaml
+pytest
