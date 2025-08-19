@@ -1,0 +1,9 @@
+# Scorecard Weights Configuration
+
+num_products: 0.25     # importance of how many products a vendor lists
+num_prices: 0.20       # importance of providing price info
+num_locations: 0.15    # importance of location info
+num_contacts: 0.15     # importance of sharing contact details
+avg_price_log: 0.10    # importance of normalized log average price (to reduce extreme values)
+min_price: 0.05        # importance of offering low-priced items
+max_price: 0.05        # importance of offering high-priced items
