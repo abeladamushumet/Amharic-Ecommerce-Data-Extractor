@@ -1,118 +1,134 @@
-# models/train_ner.py
+from datasets import Dataset
+from transformers import AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer
+import logging
+from huggingface_hub.utils import RepositoryNotFoundError
 
-"""
-Fine-tune a multilingual transformer model (XLM-RoBERTa) for Amharic Named Entity Recognition (NER)
-using your manually-labeled CoNLL file.
+logging.basicConfig(level=logging.INFO)
 
-Before running:
-1) Install dependencies with:
-   pip install transformers datasets seqeval accelerate
+# Paths
+DATA_PATH = "/content/drive/MyDrive/Colab Notebooks/Amharic-Ecommerce-Data-Extractor/data/processed/labeled_data.conll"
 
-2) Make sure you have ~1000 manually-labeled lines stored as: data/processed/labeled_data.conll
-"""
+# Label list
+label_list = [
+    "O",
+    "B-PRODUCT", "I-PRODUCT",
+    "B-PRICE", "I-PRICE",
+    "B-LOC", "I-LOC",
+    "B-CONTACT-INFO", "I-CONTACT-INFO",
+    "B-DELIVER-FEE", "I-DELIVER-FEE"
+]
+label2id = {label: i for i, label in enumerate(label_list)}
+id2label = {i: label for i, label in enumerate(label_list)}
 
-from datasets import load_dataset, DatasetDict
-from transformers import (AutoTokenizer, AutoModelForTokenClassification,
-                          DataCollatorForTokenClassification,
-                          TrainingArguments, Trainer)
-from transformers import XLMRobertaTokenizerFast
-import numpy as np
-from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
+# Models to train
+MODELS = [
+    "xlm-roberta-base",
+    "Davlan/bert-base-multilingual-cased",
+    "afroxmlr"
+]
 
-MODEL_NAME = "xlm-roberta-base"
-DATA_PATH = "data/processed/labeled_data.conll"
+def load_conll_data(file_path):
+    sentences, labels = [], []
+    with open(file_path, "r", encoding="utf-8") as f:
+        words, tags = [], []
+        for line in f:
+            line = line.strip()
+            if not line:
+                if words:
+                    sentences.append(words)
+                    labels.append(tags)
+                    words, tags = [], []
+            else:
+                splits = line.split()
+                if len(splits) < 2:
+                    print(f"[WARNING] Skipping malformed line: {line}")
+                    continue
+                words.append(splits[0])
+                tags.append(splits[1].upper().replace("_", "-"))
+        if words:
+            sentences.append(words)
+            labels.append(tags)
+    return Dataset.from_dict({
+        "tokens": sentences,
+        "ner_tags": [[label2id[tag] for tag in seq] for seq in labels]
+    })
 
+dataset = load_conll_data(DATA_PATH)
+train_test = dataset.train_test_split(test_size=0.1)
+train_dataset = train_test["train"]
+val_dataset = train_test["test"]
 
-def get_label_list():
-    # Make sure the order matches all entity types used in labeling!
-    return ["O", "B-PRODUCT", "I-PRODUCT", "B-PRICE", "I-PRICE",
-            "B-PCONTACT", "I-CONTACT", "B-LINK", "I-LINK",
-            "B-ADDRESS", "I-ADDRESS", "B-PHONE", "I-PHONE"]
-
-
-def encode_labels(labels, label2id):
-    encoded = [[label2id[t] for t in example] for example in labels]
-    return encoded
-
-
-def compute_metrics(eval_preds):
-    predictions, labels = eval_preds
-    predictions = np.argmax(predictions, axis=2)
-
-    true_labels = [[label_list[l] for l in label] for label in labels]
-    true_preds = [
-        [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-        for prediction, label in zip(predictions, labels)
-    ]
-
-    return {
-        "precision": precision_score(true_labels, true_preds),
-        "recall": recall_score(true_labels, true_preds),
-        "f1": f1_score(true_labels, true_preds)
-    }
-
-
-if __name__ == "__main__":
-    label_list = get_label_list()
-    label2id = {l: i for i, l in enumerate(label_list)}
-    id2label = {i: l for i, l in enumerate(label_list)}
-
-    raw_dataset = load_dataset("conll2003", data_files={'train': DATA_PATH, 'validation': DATA_PATH, 'test': DATA_PATH},
-                               task="ner")
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    def tokenize_and_align(batch):
-        tokenized = tokenizer(batch["tokens"], truncation=True, is_split_into_words=True)
-        new_labels = []
-        for i, labels in enumerate(batch["ner_tags"]):
-            word_ids = tokenized.word_ids(batch_index=i)
-            aligned = []
-            prev_word = None
-            for word_id in word_ids:
-                if word_id is None:
-                    aligned.append(-100)
-                elif word_id != prev_word:
-                    aligned.append(label2id[batch["ner_tags"][i][word_id]])
-                else:
-                    aligned.append(label2id[batch["ner_tags"][i][word_id]] if batch["ner_tags"][i][word_id].startswith("I") else -100)
-                prev_word = word_id
-            new_labels.append(aligned)
-        tokenized["labels"] = new_labels
-        return tokenized
-
-    encoded_dataset = raw_dataset.map(lambda x: {"tokens": x["tokens"], "ner_tags": x["ner_tags"]})
-    tokenized_dataset = encoded_dataset.map(tokenize_and_align, batched=True)
-
-    model = AutoModelForTokenClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=len(label_list),
-        id2label=id2label,
-        label2id=label2id
+def tokenize_and_align_labels(examples, tokenizer):
+    tokenized_inputs = tokenizer(
+        examples["tokens"],
+        is_split_into_words=True,
+        truncation=True,
+        padding=True
     )
+    aligned_labels = []
+    for i, labels in enumerate(examples["ner_tags"]):
+        word_ids = tokenized_inputs.word_ids(batch_index=i)
+        previous_word_idx = None
+        label_ids = []
+        for word_idx in word_ids:
+            if word_idx is None:
+                label_ids.append(-100)
+            elif word_idx != previous_word_idx:
+                label_ids.append(labels[word_idx])
+            else:
+                label_ids.append(labels[word_idx] if str(label_list[labels[word_idx]]).startswith("I-") else -100)
+            previous_word_idx = word_idx
+        aligned_labels.append(label_ids)
+    tokenized_inputs["labels"] = aligned_labels
+    return tokenized_inputs
 
-    data_collator = DataCollatorForTokenClassification(tokenizer)
+def train_model(model_name, output_dir):
+    print(f"\n🔹 Training {model_name}...\n")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForTokenClassification.from_pretrained(
+            model_name,
+            num_labels=len(label_list),
+            id2label=id2label,
+            label2id=label2id
+        )
+    except (OSError, RepositoryNotFoundError) as e:
+        logging.warning(f"Skipping {model_name}: {e}")
+        return
 
-    args = TrainingArguments(
-        output_dir="models/checkpoints",
-        evaluation_strategy="epoch",
-        learning_rate=3e-5,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
+    tokenized_train = train_dataset.map(lambda x: tokenize_and_align_labels(x, tokenizer), batched=True)
+    tokenized_val = val_dataset.map(lambda x: tokenize_and_align_labels(x, tokenizer), batched=True)
+
+    tokenized_train = tokenized_train.remove_columns(['tokens', 'ner_tags'])
+    tokenized_val = tokenized_val.remove_columns(['tokens', 'ner_tags'])
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
         num_train_epochs=3,
-        weight_decay=0.01
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        logging_dir=f"{output_dir}/logs",
+        logging_steps=10,
+        save_strategy="epoch",
+        learning_rate=5e-5,
+        weight_decay=0.01,
+        save_total_limit=2,
+        remove_unused_columns=False,
+        report_to="none"
     )
 
     trainer = Trainer(
         model=model,
-        args=args,
-        train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["validation"],
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        tokenizer=tokenizer
     )
 
     trainer.train()
-    trainer.save_model("models/final_ner_model")
-    print("Model saved → models/final_ner_model")
+    trainer.save_model(output_dir)
+    print(f"✅ Training completed for {model_name} and saved to {output_dir}")
+
+for model_name in MODELS:
+    model_folder = f"/content/drive/MyDrive/Colab Notebooks/Amharic-Ecommerce-Data-Extractor/models/{model_name.replace('/', '-')}"
+    train_model(model_name, model_folder)
